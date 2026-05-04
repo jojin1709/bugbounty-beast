@@ -175,7 +175,8 @@ sep
 banner "PHASE 3 — Screenshots"
 
 if command -v gowitness &>/dev/null && [[ -f "$LIVE_URLS" ]]; then
-  gowitness file \
+  # gowitness v3 uses 'scan file' not 'file'
+  gowitness scan file \
     -f "$LIVE_URLS" \
     --screenshot-path "$OUT/screenshots" \
     --timeout 10 \
@@ -333,19 +334,24 @@ sep
 banner "PHASE 8 — SQL Injection Scanning"
 
 SQLI_TARGETS="$OUT/sqli/targets.txt"
-grep "?" "$OUT/recon/param_urls.txt" 2>/dev/null | head -50 > "$SQLI_TARGETS" || true
+# Filter: only clean param URLs, skip encoded payloads from Wayback
+grep "?" "$OUT/recon/param_urls.txt" 2>/dev/null \
+  | grep -v "%3F\|%27\|%22\|CAST\|UNION\|SELECT\|SLEEP\|DBMS\|XMLType\|CHR(" \
+  | grep -vE "^http.{200,}" \
+  | sort -u | head -30 > "$SQLI_TARGETS" || true
 
 if command -v sqlmap &>/dev/null && [[ -s "$SQLI_TARGETS" ]]; then
-  ok "Running SQLMap on $(wc -l < "$SQLI_TARGETS") URLs..."
-  sqlmap -m "$SQLI_TARGETS" \
+  ok "Running SQLMap on $(wc -l < "$SQLI_TARGETS") clean URLs..."
+  timeout 300 sqlmap -m "$SQLI_TARGETS" \
     --batch \
     --random-agent \
-    --level=2 \
-    --risk=2 \
-    --threads=5 \
+    --level=1 \
+    --risk=1 \
+    --threads=3 \
+    --timeout=10 \
+    --retries=1 \
     --output-dir="$OUT/sqli/sqlmap_out" \
-    --forms \
-    --crawl=2 \
+    --no-cast \
     2>/dev/null || true
   ok "SQLMap done → $OUT/sqli/sqlmap_out/"
   notify "💉 Phase 8 done — SQLMap scan complete"
@@ -392,7 +398,9 @@ SSRF_PAYLOADS=(
 SSRF_PARAMS="url|uri|path|dest|redirect|next|ref|return|returnurl|window|host|target|to|link|src|source|data|href|load|fetch|open|continue|domain|callback"
 
 ok "Checking for SSRF-prone parameters..."
-grep -iE "[$SSRF_PARAMS]=" "$OUT/recon/param_urls.txt" 2>/dev/null \
+grep -iE "(\?|&)(url|uri|path|dest|redirect|src|href|target|fetch|open|data|host|domain|callback)=" \
+  "$OUT/recon/param_urls.txt" 2>/dev/null \
+  | grep -v "%\|CAST\|SELECT" \
   | head -100 > "$OUT/ssrf/ssrf_candidates.txt" || true
 
 SSRF_CAND=$(wc -l < "$OUT/ssrf/ssrf_candidates.txt" 2>/dev/null || echo 0)
@@ -400,13 +408,16 @@ ok "SSRF candidates: $SSRF_CAND"
 
 if [[ "$SSRF_CAND" -gt 0 ]]; then
   head -30 "$OUT/ssrf/ssrf_candidates.txt" | while read -r url; do
-    # Test for internal metadata endpoint reflection
     for payload in "${SSRF_PAYLOADS[@]}"; do
-      ENCODED=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$payload'))" 2>/dev/null || echo "$payload")
-      # Replace param values with SSRF payload
-      test_url=$(echo "$url" | sed -E "s/(url|uri|path|dest|redirect|src|href|target|to|link|fetch|open|data)=([^&]*)/\1=$ENCODED/gi")
+      # Use python3 to safely build test URL
+      test_url=$(python3 -c "
+import urllib.parse, re, sys
+url = '$url'
+payload = urllib.parse.quote('$payload', safe='')
+result = re.sub(r'(url|uri|path|dest|redirect|src|href|target|fetch|open|data|host|domain|callback)=([^&]*)', r'\1=' + payload, url, flags=re.IGNORECASE)
+print(result)
+" 2>/dev/null || echo "$url")
       resp=$(curl -sk --max-time 5 "$test_url" 2>/dev/null || true)
-      # Check for internal metadata leakage
       if echo "$resp" | grep -qE "(ami-id|instance-id|local-hostname|meta-data|computeMetadata|aws_|gcloud)"; then
         found "SSRF confirmed: $test_url"
         echo "$test_url" >> "$OUT/ssrf/confirmed_ssrf.txt"
